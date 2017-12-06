@@ -16,19 +16,22 @@ from tqdm import trange
 
 # hyperparameters
 discount_factor = 0.99
-learning_rate = 0.00001
-replay_memory_size = 1000
-channels = 1
-resolution = (30, 45)
+learning_rate = 0.00025
+beta_1 = 0.95
+beta_2 = 0.999
+replay_memory_size = 20000
+channels = 3
+resolution = (32, 32)
 state_shape = (replay_memory_size, channels, resolution[0], resolution[1])
 batch_size = 64
 frame_repeat = 12
-epsilon = 0.6
 
 
 def preprocess(img):
     img = skimage.transform.resize(img, resolution, mode='constant')
     img = img.astype(np.float32)
+    img = np.moveaxis(img, 2, 0)
+    img = img.reshape((1, channels, resolution[0], resolution[1]))
     return img
 
 
@@ -48,10 +51,10 @@ class ReplayMemory:
 
     def push(self, s1, action, s2, is_terminal, reward):
 
-        self.s1[self.pos, 0, :, :] = s1
+        self.s1[self.pos, :, :, :] = s1
         self.a[self.pos] = action
         if not is_terminal:
-            self.s2[self.pos, 0, :, :] = s2
+            self.s2[self.pos, :, :, :] = s2
         self.is_terminal[self.pos] = is_terminal
         self.r[self.pos] = reward
         self.pos = (self.pos + 1) % self.capacity
@@ -67,18 +70,26 @@ class ReplayMemory:
 class Net(nn.Module):
 
     def __init__(self, nb_available_actions):
+
         super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(1, 8, kernel_size=6, stride=3)
-        self.conv2 = nn.Conv2d(8, 8, kernel_size=3, stride=2)
-        self.fc1 = nn.Linear(192, 128)
+        self.conv1 = nn.Conv2d(3,  32, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(32,  32, kernel_size=3, stride=1, padding=1)
+        self.conv3 = nn.Conv2d(32,  64, kernel_size=3, stride=1, padding=1)
+        self.conv4 = nn.Conv2d(64,  64, kernel_size=3, stride=1, padding=1)
+        self.pool = nn.MaxPool2d(kernel_size=4, stride=4)
+        self.fc1 = nn.Linear(256, 128)
         self.fc2 = nn.Linear(128, nb_available_actions)
 
     def forward(self, x):
-
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = x.view(-1, 192)
-        x = F.relu(self.fc1(x))
+        LReLU = F.leaky_relu
+        x = LReLU(self.conv1(x))
+        # x = LReLU(self.conv2(x))
+        x = self.pool(x)
+        x = LReLU(self.conv3(x))
+        # x = LReLU(self.conv4(x))
+        x = self.pool(x)
+        x = x.view(-1, 256)
+        x = LReLU(self.fc1(x))
         return self.fc2(x)
 
     def learn(self, s1, target_q, optimizer):
@@ -101,7 +112,7 @@ class Net(nn.Module):
 class DQN():
 
     def __init__(self, game_instance, actions, file_name,
-                 loading, training):
+                 loading):
         self.game = game_instance
         self.actions = actions
         self.state_shape = state_shape
@@ -111,9 +122,9 @@ class DQN():
             self.net = torch.load(file_name)
         else:
             self.net = Net(len(actions))
-        self.optimizer = torch.optim.Adam(self.net.parameters(),
-                                          lr=learning_rate)
-        self.training = training
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=learning_rate,
+                                            betas=(beta_1, beta_2))
+        self.n_epoch = 1
 
     def q_values(self, s):
 
@@ -121,30 +132,42 @@ class DQN():
         s = Variable(s, requires_grad=False)
         return self.net(s)
 
-    def step(self):
+    def exploration_rate(self, n_epoch):
 
-        s1 = preprocess(self.game.get_state().screen_buffer)
+        start_eps = 1.0
+        end_eps = 0.1
+        const_eps_epochs = 1000 * n_epoch  # 10% of learning time
+        eps_decay_epochs = 6000 * n_epoch  # 60% of learning time
 
-        # Choosing action and going to next state #
-        eps = epsilon
-        if random() <= eps:
-            a = randint(0, len(self.actions) - 1)
+        if n_epoch < const_eps_epochs:
+            return start_eps
+        elif n_epoch < eps_decay_epochs:
+            # Linear decay
+            return start_eps - (epoch - const_eps_epochs) / \
+                               (eps_decay_epochs - const_eps_epochs) * (start_eps - end_eps)
         else:
-            s1 = s1.reshape([1, channels, resolution[0], resolution[1]])
-            _, index = torch.max(self.q_values(s1), 1)
-            a = index.data.numpy()[0]
+            return end_eps
 
-        reward = self.game.set_action(self.actions[a])
-        for _ in range(frame_repeat):
-            self.game.advance_action()
-        is_terminal = self.game.is_episode_finished()
-        if(not is_terminal):
-            s2 = preprocess(self.game.get_state().screen_buffer)
-        else:
-            s2 = None
+    def step(self, training):
 
-        # Optimization #
-        if(self.training):
+        if(training):
+            s1 = preprocess(self.game.get_state().screen_buffer)
+            # Choosing action according to epsilon greedy policy #
+            epsilon = self.exploration_rate(self.n_epoch)
+            if random() <= epsilon:
+                a = randint(0, len(self.actions) - 1)
+            else:
+                _, index = torch.max(self.q_values(s1), 1)
+                a = index.data.numpy()[0]
+
+            reward = self.game.make_action(self.actions[a], frame_repeat)
+            is_terminal = self.game.is_episode_finished()
+            if(not is_terminal):
+                s2 = preprocess(self.game.get_state().screen_buffer)
+            else:
+                s2 = None
+
+            # Optimization #
             self.memory.push(s1, a, s2, is_terminal, reward)
             if self.memory.size > batch_size:
                 s1, a, s2, is_terminal, r = self.memory.get_sample(batch_size)
@@ -154,5 +177,19 @@ class DQN():
                 target_q[np.arange(target_q.shape[0]), a] = delta_q
                 self.net.learn(s1, target_q, self.optimizer)
                 torch.save(self.net, self.file_name)
+
+        else:
+            s1 = preprocess(self.game.get_state().screen_buffer)
+
+            # Choosing best action #
+            _, index = torch.max(self.q_values(s1), 1)
+            a = index.data.numpy()[0]
+
+            reward = self.game.set_action(self.actions[a])
+            for _ in range(frame_repeat):
+                self.game.advance_action()
+
+
+        self.n_epoch += 1
 
         return a
