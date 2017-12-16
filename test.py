@@ -6,21 +6,20 @@ import numpy as np
 from tqdm import trange
 from models.DQN import DQN
 
-config_file_path = "scenarios/basic.cfg"
-file_name = "./pretrained_models/dqn_basic.pth"
+config_file_path = "scenarios/rocket_basic.cfg"
+file_name = "./pretrained_models/dqn_rocket_basic.pth"
 episodes_to_watch = 10
 
 
 # Creates and initializes ViZDoom environment.
 def vizdoom_init(config_file_path):
-
     print("Initializing DOOM...")
     game = DoomGame()
     game.load_config(config_file_path)
     game.set_window_visible(True)
     game.set_mode(Mode.ASYNC_PLAYER)
-    game.set_screen_format(ScreenFormat.RGB24)
-    game.set_screen_resolution(ScreenResolution.RES_640X480)
+    game.set_screen_format(ScreenFormat.CRCGCB)
+    game.set_screen_resolution(ScreenResolution.RES_640X360)
     game.init()
     print("Doom initialized.")
     return game
@@ -30,7 +29,6 @@ def vizdoom_init(config_file_path):
 game = vizdoom_init(config_file_path)
 n = game.get_available_buttons_size()
 actions = [list(a) for a in it.product([0, 1], repeat=n)]
-print("Loading model from: ", file_name)
 model = DQN(game, actions, file_name, loading=1)
 
 print("======================================")
@@ -54,6 +52,6 @@ for _ in range(episodes_to_watch):
 test_scores = np.array(test_scores)
 print("%d test episodes played." % episodes_to_watch)
 print("Results: mean: %.1f +/- %.1f,"
-      % (train_scores.mean(), train_scores.std()),
-      "min: %.1f," % train_scores.min(), "max: %.1f,"
-      % train_scores.max())
+      % (test_scores.mean(), test_scores.std()),
+      "min: %.1f," % test_scores.min(), "max: %.1f,"
+      % test_scores.max())
