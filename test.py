@@ -7,8 +7,8 @@ import torch
 from tqdm import trange
 from models.DQN import DQN
 
-config_file_path = "scenarios/health_gathering.cfg"
-file_name = "./pretrained_models/drqn_health_gathering_supreme.pth"
+config_file_path = "scenarios/take_cover.cfg"
+file_name = "./pretrained_models/drqn_prioritized_take_cover.pth"
 episodes_to_watch = 10
 
 # cuda stuff

@@ -1,6 +1,6 @@
 from vizdoom import *
 import itertools as it
-from random import sample, randint, random, randint
+from random import sample, randint, random, randint, uniform
 from collections import namedtuple
 from time import time, sleep
 from PIL import Image
@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.autograd import Variable
+from .utils.ReplayMemory import ReplayMemory
 import torchvision.transforms as T
 import skimage.transform
 import skimage.color
@@ -25,20 +26,27 @@ SHOW_IMAGES = False
 
 # dqn parameters - not ok to change will affect test
 DISCOUNT_FACTOR = 0.99
-FRAME_REPEAT = 4
-EPISODE_LENGTH = 10
+FRAME_REPEAT = 8
+EPISODE_LENGTH = 4
 LSTM_MEMORY = 512
 RESOLUTION = (52, 104)
 NB_CHANNELS = 3
 
 # dqn parameters - ok to change won't affect test
-NB_EPOCH = 250
+NB_EPOCH = 100
 DATA_AUGMENTATION = False
-REPLAY_MEMORY_SIZE = 7500
+REPLAY_MEMORY_SIZE = 10000
 BATCH_SIZE = 32
 UPDATE_FREQUENCY = 4
 Q_NET_UPDATE_FREQUENCY = 10000
-REPLAY_START_SIZE =  REPLAY_MEMORY_SIZE / 4
+REPLAY_START_SIZE = 2500
+
+# experience replay parameters
+ALPHA = 0.6
+BETA_START = 0.4
+BETA_END = 1
+BETA_LIN_DECAY_START = REPLAY_START_SIZE
+BETA_LIN_DECAY_END = REPLAY_START_SIZE * NB_EPOCH
 
 # epsilon schedule parameters
 EPS_START = 1
@@ -56,6 +64,7 @@ ByteTensor = torch.ByteTensor
 
 # Transition
 Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
+TransitionV2 = namedtuple('TransitionV2', ('state', 'action', 'next_state', 'reward', 'index', 'weight'))
 
 # https://github.com/pytorch/pytorch/issues/229
 def flip(x, dim):
@@ -80,95 +89,6 @@ def preprocess(img):
     img = np.moveaxis(img, -1, 1)
 
     return img
-
-
-class ReplayMemory(object):
-
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.memory = []
-        self.position = 0
-
-    # add a transition in memory
-    def push(self, *args):
-        if len(self.memory) < self.capacity:
-            self.memory.append(None)
-        self.memory[self.position] = Transition(*args)
-        self.position = (self.position + 1) % self.capacity
-
-    # sample a batch from memory
-    def sample(self):
-
-        samples = []
-        for i in range(BATCH_SIZE):
-
-            # picking random element from memory
-            index = randint(0, len(self) - 1)
-            state = self.memory[index].state
-            next_state = self.memory[index].next_state
-            action = self.memory[index].action
-            reward = self.memory[index].reward
-
-            # data augmention
-            if(DATA_AUGMENTATION):
-                u = random()
-                if(u >= 1/2):
-                    state = flip(state, -1)
-                    if(next_state is not None):
-                        next_state = flip(next_state, -1)
-
-
-            # adding to samples
-            samples += [Transition(state, action, next_state, reward)]
-        batch = Transition(*zip(*samples))
-
-        return batch
-
-    # sample batch_size short episodes of length episode_length from memory
-    def sample_episode(self):
-        i = 0
-        episodes = []
-        while(i < BATCH_SIZE):
-            frames = torch.Tensor(EPISODE_LENGTH, 1, NB_CHANNELS,
-            RESOLUTION[0], RESOLUTION[1]).type(FloatTensor)
-            frames_next = torch.Tensor(EPISODE_LENGTH, 1, NB_CHANNELS,
-            RESOLUTION[0], RESOLUTION[1]).type(FloatTensor)
-            begin = randint(0, len(self) - EPISODE_LENGTH - 1)
-
-            for j in range(EPISODE_LENGTH):
-                # we're about to add the episode in the batch
-                if(j == EPISODE_LENGTH - 1):
-                    frames[j] = self.memory[begin + j].state
-                    is_terminal = (self.memory[begin + j].next_state is None)
-                    if(is_terminal):
-                        frames_next = None
-                    else:
-                        frames_next[j] = self.memory[begin + j + 1].state
-                    action = self.memory[begin + j].action
-                    reward = self.memory[begin + j].reward
-                    if(DATA_AUGMENTATION):
-                        u = random()
-                        if(u >= 1/2):
-                            frames = flip(frames, -1)
-                            if(frames_next is not None):
-                                frames_next = flip(frames_next, -1)
-                    episodes += [Transition(frames, action, frames_next, reward)]
-                    i += 1
-
-                # we jumped to another scenario, we reject the sample
-                elif(self.memory[begin + j].next_state is None):
-                    break
-
-                # onto next fram
-                else:
-                    frames[j] = self.memory[begin + j].state
-                    frames_next[j] = self.memory[begin + j + 1].state
-
-        batch = Transition(*zip(*episodes))
-        return batch
-
-    def __len__(self):
-        return len(self.memory)
 
 
 class DQNet(nn.Module):
@@ -279,7 +199,7 @@ class DRQNet(nn.Module):
 class DQN():
 
     def __init__(self, game_instance, actions, file_name, ddqn=False, drqn=False,
-                gpu=False, loading=False):
+                prioritized=False, gpu=False, loading=False):
 
         # misc
         self.game = game_instance
@@ -289,10 +209,9 @@ class DQN():
         self.history_frames = np.zeros((EPISODE_LENGTH, 1, NB_CHANNELS,
                                         RESOLUTION[0], RESOLUTION[1]))
 
-        # DQN memory and DQNetworks
+        # DQNetworks
         self.ddqn = ddqn
         self.drqn = drqn
-        self.memory = ReplayMemory(capacity=REPLAY_MEMORY_SIZE)
         if(loading):
             print("Loading model from: ", file_name)
             self.q_net = torch.load(file_name)
@@ -303,8 +222,9 @@ class DQN():
                 self.q_net = DQNet(len(actions))
         self.q_net_target = copy.deepcopy(self.q_net)
         self.optimizer = torch.optim.RMSprop(self.q_net.parameters(),
-                                             lr=LR_START)
+                                            lr=LR_START)
 
+        # if we're using gpu
         if(gpu):
             global FloatTensor
             global LongTensor
@@ -314,6 +234,12 @@ class DQN():
             ByteTensor = torch.cuda.ByteTensor
             self.q_net.cuda()
             self.q_net_target.cuda()
+
+        # DQN memory
+        self.prioritized = prioritized
+        self.memory = ReplayMemory(capacity=REPLAY_MEMORY_SIZE,
+                                    prioritized=prioritized)
+
 
     def append_history(self, state):
 
@@ -325,17 +251,24 @@ class DQN():
                 save_image(self.history_frames[i,0,:,:,:],
                                 "hist_"+str(i)+".png")
 
-    def learn(self, q_values, expected_q_values):
+    def learn(self, q_values, expected_q_values, weights_IS=1):
 
         # computing loss
-        loss = F.smooth_l1_loss(q_values, expected_q_values)
+        batch_loss = (torch.abs(q_values - expected_q_values) < 1).float() *\
+                     (q_values - expected_q_values) ** 2 +\
+                     (torch.abs(q_values - expected_q_values) >= 1).float() *\
+                     (torch.abs(q_values - expected_q_values) - 0.5)
+        weighted_batch_loss = weights_IS * batch_loss
+        weighted_loss = weighted_batch_loss.sum()
 
         # gradient descent step
         self.optimizer.zero_grad()
-        loss.backward()
+        weighted_loss.backward()
+        for p in self.q_net.parameters():
+            p.grad.data.clamp_(-1, 1)
         self.optimizer.step()
 
-        return loss
+        return weighted_loss
 
     def select_action(self, state, training):
 
@@ -352,7 +285,7 @@ class DQN():
             else:
                 return self.q_net(Variable(state, volatile=True).type(FloatTensor)).data.max(1)[1].view(1, 1)
         else:
-            return LongTensor([[randint(0, len(self.actions) - 1)]])
+            return torch.LongTensor([[randint(0, len(self.actions) - 1)]])
 
     def save(self):
 
@@ -366,28 +299,25 @@ class DQN():
         preprocessed_frame = preprocess(frame)
         if(self.drqn):
             self.append_history(preprocessed_frame)
-        s1 = torch.from_numpy(preprocessed_frame).type(FloatTensor)
+        s1 = torch.from_numpy(preprocessed_frame).type(torch.FloatTensor)
         a = self.select_action(s1, training)
 
         # if we're training the DQNetwork
         if(training):
 
             # experiencing transition and adding it in memory
-            reward = FloatTensor([self.game.make_action(self.actions[a[0][0]], FRAME_REPEAT)])
+            reward = torch.FloatTensor([self.game.make_action(self.actions[a[0][0]], FRAME_REPEAT)])
             is_terminal = self.game.is_episode_finished()
             if(not is_terminal):
                 frame = self.game.get_state().screen_buffer
                 preprocessed_frame = preprocess(frame)
-                if(self.drqn):
-                    s2 = torch.from_numpy(preprocessed_frame).type(FloatTensor)
-                else:
-                    s2 = torch.from_numpy(preprocessed_frame).type(FloatTensor)
+                s2 = torch.from_numpy(preprocessed_frame).type(torch.FloatTensor)
             else:
                 s2 = None
             self.memory.push(s1, a, s2, reward)
 
              # learning
-            if (len(self.memory) > REPLAY_START_SIZE and
+            if (self.n_steps > REPLAY_START_SIZE and
                 self.n_steps % UPDATE_FREQUENCY == 0):
 
                 # getting batch
@@ -396,12 +326,16 @@ class DQN():
                 else:
                     batch = self.memory.sample()
 
-                state_batch = Variable(torch.cat(batch.state, dim=self.drqn))
-                action_batch = Variable(torch.cat(batch.action))
-                reward_batch = Variable(torch.cat(batch.reward))
+                state_batch = Variable(torch.cat(batch.state, dim=self.drqn).type(FloatTensor))
+                action_batch = Variable(torch.cat(batch.action).type(LongTensor))
+                reward_batch = Variable(torch.cat(batch.reward).type(FloatTensor))
+
+                # for i in range(state_batch.size()[0]):
+                #     save_image(state_batch[i,10,:,:,:].data.cpu().numpy(), "batch_"+str(i)+".png")
 
                 # taking care of final states
-                non_final_next_states = Variable(torch.cat([s for s in batch.next_state if s is not None], dim=self.drqn), volatile=True)
+                non_final_next_states = Variable(torch.cat([s for s in batch.next_state if s is not None],
+                                                dim=self.drqn).type(FloatTensor), volatile=True)
                 non_final_mask = ByteTensor(tuple(map(lambda s: s is not None, batch.next_state)))
 
                 # computing expected q values with background DQNetwork
@@ -416,10 +350,22 @@ class DQN():
                 expected_q_values.volatile = False
 
                 # computing q values with DQNetwork
-                q_values = self.q_net(state_batch).gather(1, action_batch)
+                q_values = self.q_net(state_batch).gather(1, action_batch).squeeze()
+
+                # computing errors and weigths for experience replay
+                weights_IS = 1
+                if(self.prioritized):
+                    BETA = min(BETA_END, BETA_START + (self.n_steps - BETA_LIN_DECAY_START) *
+                                                    (BETA_END - BETA_START) /
+                                                    (BETA_LIN_DECAY_END - BETA_LIN_DECAY_START))
+                    errors = torch.abs(q_values - expected_q_values) ** ALPHA
+                    weights_IS = Variable(torch.cat(batch.weight).type(FloatTensor)) ** BETA
+                    weights_IS = torch.sqrt(weights_IS / weights_IS.max())
+                    indexes = torch.cat(batch.index)
+                    self.memory.update_prior(indexes, errors)
 
                 # descent step
-                self.learn(q_values, expected_q_values)
+                self.learn(q_values, expected_q_values, weights_IS)
 
                 # updating the background DQNetwork every
                 # Q_NET_UPDATE_FREQUENCY step

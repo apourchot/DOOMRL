@@ -8,10 +8,10 @@ from tqdm import trange
 from models.DQN import DQN
 import sys
 
-load_model = True
-config_file_path = "scenarios/health_gathering.cfg"
-file_name = "./pretrained_models/drqn_health_gathering_supreme.pth"
-epochs = 250
+load_model = False
+config_file_path = "scenarios/take_cover.cfg"
+file_name = "./pretrained_models/drqn_prioritized_take_cover.pth"
+epochs = 100
 learning_steps_per_epoch = 10000
 episodes_to_watch = 100
 best_mean = float("-inf")
@@ -20,6 +20,7 @@ best_mean = float("-inf")
 use_gpu = False
 use_ddqn = False
 use_drqn = True
+use_prioritized = True
 if(torch.cuda.is_available()):
     print("Using GPU: " + torch.cuda.get_device_name(torch.cuda.current_device()))
     use_gpu = True
@@ -46,9 +47,11 @@ n = game.get_available_buttons_size()
 actions = [list(a) for a in it.product([0, 1], repeat=n)]
 
 if load_model:
-    model = DQN(game, actions, file_name, drqn=use_drqn, ddqn=use_ddqn, gpu=use_gpu, loading=1)
+    model = DQN(game, actions, file_name, drqn=use_drqn,
+    prioritized=use_prioritized, ddqn=use_ddqn, gpu=use_gpu, loading=1)
 else:
-    model = DQN(game, actions, file_name, drqn=use_drqn, ddqn=use_ddqn, gpu=use_gpu, loading=0)
+    model = DQN(game, actions, file_name, drqn=use_drqn,
+    prioritized=use_prioritized, ddqn=use_ddqn, gpu=use_gpu, loading=0)
 
 print("Starting the training.")
 time_start = time()
