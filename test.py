@@ -7,14 +7,14 @@ import torch
 from tqdm import trange
 from models.DQN import DQN
 
-config_file_path = "scenarios/take_cover.cfg"
-file_name = "./pretrained_models/drqn_prioritized_take_cover.pth"
+config_file_path = "scenarios/health_gathering.cfg"
+file_name = "./pretrained_models/ddqn_health_gathering_simple.pth"
 episodes_to_watch = 10
 
 # cuda stuff
 use_gpu = False
-use_ddqn = False
-use_drqn = True
+use_ddqn = not False
+use_drqn = not True
 if(torch.cuda.is_available()):
     print("Using GPU: " + torch.cuda.get_device_name(torch.cuda.current_device()))
     use_gpu = True

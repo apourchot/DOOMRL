@@ -33,10 +33,10 @@ RESOLUTION = (52, 104)
 NB_CHANNELS = 3
 
 # dqn parameters - ok to change won't affect test
-NB_EPOCH = 100
+NB_EPOCH = 50
 DATA_AUGMENTATION = False
 REPLAY_MEMORY_SIZE = 10000
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 UPDATE_FREQUENCY = 4
 Q_NET_UPDATE_FREQUENCY = 10000
 REPLAY_START_SIZE = 2500
@@ -55,7 +55,7 @@ EPS_LIN_DECAY_START = REPLAY_START_SIZE
 EPS_LIN_DECAY_END = REPLAY_START_SIZE * NB_EPOCH
 
 # lr schedule parameters
-LR_START = 0.00005
+LR_START = 0.00025
 
 # pytorch tensors
 FloatTensor = torch.FloatTensor
@@ -126,6 +126,8 @@ class DQNet(nn.Module):
 
         LReLU = F.leaky_relu
 
+        x = x / 255.
+
         # conv layers
         x = LReLU(self.conv1(x))
         x = self.batch_norm1(x)
@@ -178,6 +180,8 @@ class DRQNet(nn.Module):
         hidden_state = Variable(torch.zeros(1, x.size(1), LSTM_MEMORY).type(FloatTensor))
         cell_state = Variable(torch.zeros(1, x.size(1), LSTM_MEMORY).type(FloatTensor))
 
+        x = x / 255.
+
         # conv layers
         z = Variable(torch.zeros(x.size(0), x.size(1), 1728)).type(FloatTensor)
         for k in range(x.size(0)):
@@ -214,14 +218,16 @@ class DQN():
         self.drqn = drqn
         if(loading):
             print("Loading model from: ", file_name)
-            self.q_net = torch.load(file_name)
+            self.q_net = torch.load(file_name, map_location=lambda storage, loc: storage)
         else:
             if(self.drqn):
                 self.q_net = DRQNet(len(actions))
             else:
                 self.q_net = DQNet(len(actions))
         self.q_net_target = copy.deepcopy(self.q_net)
-        self.optimizer = torch.optim.RMSprop(self.q_net.parameters(),
+        self.optimizer = torch.optim.Adam(self.q_net.parameters(),
+                                            betas=(0.9, 0.999),
+                                            eps=10**-8,
                                             lr=LR_START)
 
         # if we're using gpu
@@ -254,10 +260,11 @@ class DQN():
     def learn(self, q_values, expected_q_values, weights_IS=1):
 
         # computing loss
-        batch_loss = (torch.abs(q_values - expected_q_values) < 1).float() *\
-                     (q_values - expected_q_values) ** 2 +\
-                     (torch.abs(q_values - expected_q_values) >= 1).float() *\
-                     (torch.abs(q_values - expected_q_values) - 0.5)
+        # batch_loss = (torch.abs(q_values - expected_q_values) < 1).float() *\
+        #              (q_values - expected_q_values) ** 2 +\
+        #              (torch.abs(q_values - expected_q_values) >= 1).float() *\
+        #              (torch.abs(q_values - expected_q_values) - 0.5)
+        batch_loss = (q_values - expected_q_values) ** 2
         weighted_batch_loss = weights_IS * batch_loss
         weighted_loss = weighted_batch_loss.sum()
 
@@ -265,7 +272,7 @@ class DQN():
         self.optimizer.zero_grad()
         weighted_loss.backward()
         for p in self.q_net.parameters():
-            p.grad.data.clamp_(-1, 1)
+            p.grad.data.clamp_(-10, 10)
         self.optimizer.step()
 
         return weighted_loss
@@ -335,17 +342,17 @@ class DQN():
 
                 # taking care of final states
                 non_final_next_states = Variable(torch.cat([s for s in batch.next_state if s is not None],
-                                                dim=self.drqn).type(FloatTensor), volatile=True)
+                                                dim=self.drqn).type(FloatTensor))
                 non_final_mask = ByteTensor(tuple(map(lambda s: s is not None, batch.next_state)))
 
                 # computing expected q values with background DQNetwork
                 if(self.drqn or self.ddqn):
                     next_v_values = Variable(torch.zeros(BATCH_SIZE).type(FloatTensor))
-                    arg_max = self.q_net(non_final_next_states).max(1)[1].view(-1, 1)
-                    next_v_values[non_final_mask] = self.q_net_target(non_final_next_states).gather(1, arg_max)
+                    arg_max = self.q_net(non_final_next_states).detach().max(1)[1].view(-1, 1)
+                    next_v_values[non_final_mask] = self.q_net_target(non_final_next_states).detach().gather(1, arg_max)
                 else:
                     next_v_values = Variable(torch.zeros(BATCH_SIZE).type(FloatTensor))
-                    next_v_values[non_final_mask] = self.q_net_target(non_final_next_states).max(1)[0]
+                    next_v_values[non_final_mask] = self.q_net_target(non_final_next_states).detach().max(1)[0]
                 expected_q_values = next_v_values * DISCOUNT_FACTOR + reward_batch
                 expected_q_values.volatile = False
 

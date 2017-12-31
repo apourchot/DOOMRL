@@ -22,7 +22,7 @@ NB_CHANNELS = 3
 
 # dqn parameters - ok to change won't affect test
 DATA_AUGMENTATION = False
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 
 class ReplayMemory(object):
 
