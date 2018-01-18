@@ -12,25 +12,24 @@ LongTensor = torch.LongTensor
 ByteTensor = torch.ByteTensor
 
 # Transitions
-Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
-TransitionV2 = namedtuple('TransitionV2', ('state', 'action', 'next_state', 'reward', 'index', 'weight'))
+Transition = namedtuple('Transition', ('state', 'variable', 'action', 'next_state', 'next_variable', 'reward'))
+TransitionV2 = namedtuple('TransitionV2', ('state', 'variable', 'action', 'next_state', 'next_variable', 'reward', 'index', 'weight'))
 
 # dqn parameters - not ok to change will affect test
-EPISODE_LENGTH = 4
-RESOLUTION = (52, 104)
+RESOLUTION = (60, 108)
 NB_CHANNELS = 3
 
 # dqn parameters - ok to change won't affect test
 DATA_AUGMENTATION = False
-BATCH_SIZE = 64
 
 class ReplayMemory(object):
 
-    def __init__(self, capacity, prioritized=False):
+    def __init__(self, capacity, nb_game_variables, prioritized=False):
 
         self.capacity = capacity
         self.prioritized = prioritized
         self.states = torch.zeros(capacity, 1, NB_CHANNELS, RESOLUTION[0], RESOLUTION[1]).type(FloatTensor)
+        self.variables = torch.zeros(capacity, 1, nb_game_variables)
         self.rewards = torch.zeros(capacity, 1).type(FloatTensor)
         self.actions = torch.zeros(capacity, 1, 1).type(LongTensor)
         self.is_terminal = torch.zeros(capacity).type(ByteTensor)
@@ -43,6 +42,7 @@ class ReplayMemory(object):
     def push(self, *args):
         T = Transition(*args)
         self.size = min(self.capacity, self.size + 1)
+        self.variables[self.position] = T.variable
         self.states[self.position] = T.state
         self.actions[self.position] = T.action
         self.rewards[self.position] = T.reward
@@ -54,49 +54,41 @@ class ReplayMemory(object):
                 weight = self.sum_tree.max()
             self.sum_tree.add(weight)
         self.position = (self.position + 1) % self.capacity
-        if(not self.is_terminal[self.position - 1]):
-            self.states[self.position] = T.next_state
 
     # updating prior for prioritized replay
     def update_prior(self, indexes, priors):
         a = time()
-        for i in range(BATCH_SIZE):
+        for i in range(len(indexes)):
             self.sum_tree.set(indexes[i], priors[i])
         self.sum_tree.update_tree()
 
     # sample a batch from memory
-    def sample(self):
+    def sample(self, batch_size):
         samples = []
         if(self.prioritized):
-            segment = self.sum_tree.total() / BATCH_SIZE
-        for i in range(BATCH_SIZE):
+            segment = self.sum_tree.total() / batch_size
+            total = self.sum_tree.total()
+        for i in range(batch_size):
 
             # picking random element from memory
             if(self.prioritized):
                 u = uniform(segment * i, segment * (i + 1))
                 index, p = self.sum_tree.get(u)
-                weigth = FloatTensor([segment / p])
+                weigth = FloatTensor([1 / (p/total * self.size)])
             else:
                 index = randint(0, self.size - 1)
             state = self.states[index]
             next_state = self.states[(index + 1) % self.capacity] if not self.is_terminal[index] else None
+            variable = self.variables[index]
+            next_variable = self.variables[(index + 1) % self.capacity] if not self.is_terminal[index] else None
             action = self.actions[index]
             reward = self.rewards[index]
 
-            # data augmention
-            # if(DATA_AUGMENTATION):
-            #     u = random()
-            #     if(u >= 1/2):
-            #         state = flip(state, -1)
-            #         if(next_state is not None):
-            #             next_state = flip(next_state, -1)
-
-
             # adding to samples
             if(self.prioritized):
-                samples += [TransitionV2(state, action, next_state, reward, LongTensor([index]), weigth)]
+                samples += [TransitionV2(state, variable, action, next_state, next_variable, reward, LongTensor([index]), weigth)]
             else:
-                samples += [Transition(state, action, next_state, reward)]
+                samples += [Transition(state, variable, action, next_state, next_variable, reward)]
         if(self.prioritized):
             batch = TransitionV2(*zip(*samples))
         else:
@@ -105,7 +97,7 @@ class ReplayMemory(object):
         return batch
 
     # sample batch_size short episodes of length episode_length from memory
-    def sample_episode(self):
+    def sample_episode(self, batch_size, episode_length):
 
         a = time()
 
@@ -116,7 +108,7 @@ class ReplayMemory(object):
         if(self.prioritized):
             segment = self.sum_tree.total() / self.size
 
-        while(i < BATCH_SIZE):
+        while(i < batch_size):
 
             # sampling from memory
             if(self.prioritized):
@@ -138,7 +130,7 @@ class ReplayMemory(object):
                                 NB_CHANNELS, RESOLUTION[0], RESOLUTION[1]) if not is_terminal else None
 
             # populating history
-            for j in range(1, EPISODE_LENGTH):
+            for j in range(1, episode_length):
 
                 # did we jump from one episode to another ?
                 ep_jump = False # self.is_terminal[(begin - j) % self.capacity]
@@ -157,12 +149,11 @@ class ReplayMemory(object):
                     frames_next = torch.cat((next_frame, frames_next), 0)
 
             # adding to samples
-            if(not ep_jump):
-                if(self.prioritized):
-                    episodes += [TransitionV2(frames, action, frames_next, reward, LongTensor([begin]), weigth)]
-                else:
-                    episodes += [Transition(frames, action, frames_next, reward)]
-                i += 1
+            if(self.prioritized):
+                episodes += [TransitionV2(frames, action, frames_next, reward, LongTensor([begin]), weigth)]
+            else:
+                episodes += [Transition(frames, action, frames_next, reward)]
+            i += 1
 
         if(self.prioritized):
             batch = TransitionV2(*zip(*episodes))

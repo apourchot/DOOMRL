@@ -7,14 +7,16 @@ import torch
 from tqdm import trange
 from models.DQN import DQN
 
-config_file_path = "scenarios/health_gathering.cfg"
-file_name = "./pretrained_models/ddqn_health_gathering_simple.pth"
+model_name = "ddqn_prioritized_softtarget_defend_the_center"
+config_file_path = "scenarios/defend_the_center.cfg"
+file_name = "./pretrained_models/"+model_name+".pth"
 episodes_to_watch = 10
 
 # cuda stuff
 use_gpu = False
 use_ddqn = not False
 use_drqn = not True
+use_parameter_exploration = False
 if(torch.cuda.is_available()):
     print("Using GPU: " + torch.cuda.get_device_name(torch.cuda.current_device()))
     use_gpu = True
@@ -40,7 +42,8 @@ game = vizdoom_init(config_file_path)
 n = game.get_available_buttons_size()
 actions = [list(a) for a in it.product([0, 1], repeat=n)]
 
-model = DQN(game, actions, file_name, drqn=use_drqn, ddqn=use_ddqn, gpu=use_gpu, loading=1)
+model = DQN(game, actions, file_name, ddqn=use_ddqn, parameter_exploration=use_parameter_exploration,
+            gpu=use_gpu, loading=1)
 
 print("======================================")
 print("Testing trained neural network.")

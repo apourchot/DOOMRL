@@ -1,176 +1,481 @@
 from vizdoom import *
 import itertools as it
-from random import sample, randint, random
+from random import sample, randint, random, randint, uniform
 from collections import namedtuple
 from time import time, sleep
 from PIL import Image
+from time import time
 import numpy as np
+import copy
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.autograd import Variable
+from .utils.ReplayMemory import ReplayMemory
 import torchvision.transforms as T
 import skimage.transform
 import skimage.color
 import skimage.io
 import skimage
+from scipy.misc import imresize, imsave
 from tqdm import trange
 
-# hyperparameters
-discount_factor = 0.99
-learning_rate = 0.00025
-beta_1 = 0.95
-beta_2 = 0.999
-replay_memory_size = 20000
-channels = 1
-resolution = (32, 32)
-state_shape = (replay_memory_size, channels, resolution[0], resolution[1])
-batch_size = 64
-frame_repeat = 12
-eps_start = 1
-eps_end = 0.1
-eps_decay = 10000
+# to save images
+SHOW_IMAGES = False
 
+# dqn parameters - not ok to change will affect test
+DISCOUNT_FACTOR = 0.99
+FRAME_REPEAT = 4
+EPISODE_LENGTH = 8
+EPISODE_UPDATES = 4
+RNN_MEMORY = 512
+RESOLUTION = (60, 108)
+NB_CHANNELS = 3
 
-def preprocess(img):
-    img = skimage.transform.resize(img, resolution, mode='constant')
-    img = img.astype(np.float32)
-    img = img.reshape((1, channels, resolution[0], resolution[1]))
-    return torch.from_numpy(img).type(torch.FloatTensor)
+# dqn parameters - ok to change won't affect test
+NB_EPOCH = 25
+DATA_AUGMENTATION = False
+REPLAY_MEMORY_SIZE = 10000
+BATCH_SIZE = 64
+UPDATE_FREQUENCY = 4
+DROPOUT_RATIO = 0.05
+USE_BATCH_NORM = True
+Q_NET_UPDATE_FREQUENCY = 10000
+LAG = 0.9995
+REPLAY_START_SIZE = 5000
 
-# preprocess = T.Compose([T.ToPILImage(), T.Resize(64, interpolation=Image.CUBIC), T.ToTensor()])
+# experience replay parameters
+ALPHA = 0.7
+BETA_START = 0.5
+BETA_END = 1
+BETA_LIN_DECAY_START = REPLAY_START_SIZE
+BETA_LIN_DECAY_END = REPLAY_START_SIZE * NB_EPOCH
+
+# epsilon schedule parameters
+EPS_START = 0.5
+EPS_END = 0.1
+EPS_LIN_DECAY_START = REPLAY_START_SIZE
+EPS_LIN_DECAY_END = REPLAY_START_SIZE * NB_EPOCH
+
+# lr schedule parameters
+LR_START = 0.00025
+
+# pytorch tensors
+FloatTensor = torch.FloatTensor
+LongTensor = torch.LongTensor
+ByteTensor = torch.ByteTensor
+
+# Transition
 Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
+TransitionV2 = namedtuple('TransitionV2', ('state', 'action', 'next_state', 'reward', 'index', 'weight'))
+
+# https://github.com/pytorch/pytorch/issues/229
+def flip(x, dim):
+
+    dim = x.dim() + dim if dim < 0 else dim
+    inds = tuple(slice(None, None) if i != dim
+             else x.new(torch.arange(x.size(i)-1, -1, -1).tolist()).long()
+             for i in range(x.dim()))
+
+    return x[inds]
+
+def get_game_variables(game, variables):
+
+    result = []
+    for variable in variables:
+        if variable not in [GameVariable.POSITION_X, GameVariable.POSITION_Y]:
+            result.append(game.get_game_variable(variable))
+
+    return [result]
 
 
-class ReplayMemory(object):
+def save_image(img, file_name):
 
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.memory = []
-        self.position = 0
+    img = img.squeeze()
+    img = np.moveaxis(img, 0, -1)
+    imsave(file_name, img)
 
-    def push(self, *args):
-        if len(self.memory) < self.capacity:
-            self.memory.append(None)
-        self.memory[self.position] = Transition(*args)
-        self.position = (self.position + 1) % self.capacity
+def preprocess(img, is_drqn=False):
 
-    def sample(self, batch_size):
-        return sample(self.memory, batch_size)
+    img = imresize(img, RESOLUTION)
+    img = np.reshape(img, (1, RESOLUTION[0], RESOLUTION[1], NB_CHANNELS))
+    img = np.moveaxis(img, -1, 1)
+    img = img.astype(np.float32)
+    img = img / 255.0
 
-    def __len__(self):
-        return len(self.memory)
+    return img
+
+def repeat(tensor, n_repeat):
+
+    size = tensor.size()
+    if(len(size) == 1):
+        return tensor.view(-1, 1).repeat(1, n_repeat).view(-1, 1).squeeze()
+    else:
+        return tensor.repeat(1, n_repeat).view(-1, 1)
 
 
-class Net(nn.Module):
+class DQNet(nn.Module):
 
-    def __init__(self, nb_available_actions):
+    def __init__(self, nb_available_actions, nb_game_variables):
 
-        super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(channels, 8, kernel_size=3, stride=1, padding=1)
-        self.conv2 = nn.Conv2d(8, 8, kernel_size=3, stride=1, padding=1)
-        self.conv3 = nn.Conv2d(8, 8, kernel_size=3, stride=1, padding=1)
-        self.conv4 = nn.Conv2d(8, 8, kernel_size=3, stride=1, padding=1)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.fc1 = nn.Linear(512, 128)
-        self.fc2 = nn.Linear(128, nb_available_actions)
+        super(DQNet, self).__init__()
 
-    def forward(self, x):
+        # conv layers
+        self.conv1 = nn.Conv2d(NB_CHANNELS, 32, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3,stride=1)
+
+        # fc layers
+        self.fc1 = nn.Linear(2560+nb_game_variables, 512)
+        self.fc2 = nn.Linear(512, nb_available_actions)
+
+        # batch norm
+        self.batch_norm1 = nn.BatchNorm2d(32)
+        self.batch_norm2 = nn.BatchNorm2d(64)
+
+        # dropout
+        self.dropout = nn.Dropout(p=DROPOUT_RATIO)
+
+        xavier_init = torch.nn.init.xavier_uniform
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                xavier_init(m.weight.data)
+                m.bias.data.fill_(0)
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.fill_(0)
+            elif isinstance(m, nn.Linear):
+                xavier_init(m.weight.data)
+                m.bias.data.fill_(0)
+
+    def forward(self, x, game_variables=None, train=True):
 
         LReLU = F.leaky_relu
+
+        # conv layers
         x = LReLU(self.conv1(x))
+        if USE_BATCH_NORM:
+            x = self.batch_norm1(x)
         x = LReLU(self.conv2(x))
-        x = self.pool(x)
+        if USE_BATCH_NORM:
+            x = self.batch_norm2(x)
         x = LReLU(self.conv3(x))
-        x = LReLU(self.conv4(x))
-        x = self.pool(x)
+
+        # fc layers
         x = x.view(x.size(0), -1)
+        x = torch.cat((x, game_variables), dim=1)
         x = LReLU(self.fc1(x))
+        if(train):
+            x = self.dropout(x)
         return self.fc2(x)
+
+
+class DRQNet(nn.Module):
+
+    def __init__(self, nb_available_actions, nb_game_variables):
+
+        super(DRQNet, self).__init__()
+
+        # conv layers
+        self.conv1 = nn.Conv2d(NB_CHANNELS, 32, kernel_size=8, stride=4)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=4, stride=2)
+        self.conv3 = nn.Conv2d(64, 64, kernel_size=3,stride=1)
+
+        # lstm
+        self.gru = nn.GRU(1728+nb_game_variables, RNN_MEMORY, 1)
+
+        # fc layers
+        self.fc = nn.Linear(RNN_MEMORY, nb_available_actions)
+
+        # batch norm
+        self.batch_norm1 = nn.BatchNorm2d(32)
+        self.batch_norm2 = nn.BatchNorm2d(64)
+
+        # dropout
+        self.dropout = nn.Dropout(p=DROPOUT_RATIO)
+
+        xavier_init = torch.nn.init.xavier_uniform
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                xavier_init(m.weight.data)
+                m.bias.data.fill_(0)
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.fill_(0)
+            elif isinstance(m, nn.Linear):
+                xavier_init(m.weight.data)
+                m.bias.data.fill_(0)
+            # elif isinstance(m, nn.GRU):
+            #     xavier_init(m.weight_ih_l0.data)
+            #     xavier_init(m.weight_hh_l0.data)
+            #     m.bias_ih_l0.data.fill_(0)
+            #     m.bias_hh_l0.data.fill_(0)
+
+    def forward(self, x, train=True):
+
+        LReLU = F.leaky_relu
+
+        # conv layers
+        z = Variable(torch.zeros(x.size(0), x.size(1), 1728)).type(FloatTensor)
+        for k in range(x.size(0)):
+            y = LReLU(self.conv1(x[k]))
+            if USE_BATCH_NORM:
+                y = self.batch_norm1(y)
+            y = LReLU(self.conv2(y))
+            if USE_BATCH_NORM:
+                y = self.batch_norm2(y)
+            y = LReLU(self.conv3(y))
+            z[k] = y.view(y.size(0), 1728)
+
+        # lstm layer
+        self.gru.flatten_parameters()
+        z, _ = self.gru(z)
+
+        # linear layer simulating larger batch
+        if(train):
+            z = z[EPISODE_UPDATES:]
+            z = self.dropout(z)
+            z = self.fc(z)
+            z = z.view(-1, z.size(-1))
+            return z
+        else:
+            z = z[-1]
+            z = self.fc(z)
+            return z
 
 
 class DQN():
 
-    def __init__(self, game_instance, actions, file_name, loading):
+    def __init__(self, game_instance, actions, file_name, ddqn=False, drqn=False,
+                prioritized=False, gpu=False, loading=False):
 
+        # misc
         self.game = game_instance
         self.actions = actions
-        self.state_shape = state_shape
         self.file_name = file_name
-        self.memory = ReplayMemory(capacity=replay_memory_size)
-        if(loading):
-            self.net = torch.load(file_name)
-        else:
-            self.net = Net(len(actions))
-        self.optimizer = torch.optim.RMSprop(self.net.parameters(), lr=learning_rate)
+        self.available_game_variables = game_instance.get_available_game_variables()
+        self.nb_game_variables = len([v for v in self.available_game_variables
+                                     if v not in [GameVariable.POSITION_X,
+                                                  GameVariable.POSITION_Y]])
         self.n_steps = 1
 
-    def learn(self, q_values, expected_q_values):
+        # DQNetworks
+        self.ddqn = ddqn
+        self.drqn = drqn
+        if(loading):
+            print("Loading model from: ", file_name)
+            self.q_net = torch.load(file_name, map_location=lambda storage, loc: storage)
+        else:
+            if(self.drqn):
+                self.q_net = DRQNet(len(actions),
+                                    self.nb_game_variables)
+            else:
+                self.q_net = DQNet(len(actions),
+                                    self.nb_game_variables)
+        self.q_net_target = copy.deepcopy(self.q_net)
+        self.optimizer = torch.optim.Adam(self.q_net.parameters(),
+                                            betas=(0.9, 0.999),
+                                            eps=10**-8,
+                                            lr=LR_START)
+        # self.optimizer = torch.optim.RMSprop(self.q_net.parameters(),
+        #                                      lr=LR_START)
+
+        # if we're using gpu
+        if(gpu):
+            global FloatTensor
+            global LongTensor
+            global ByteTensor
+            FloatTensor = torch.cuda.FloatTensor
+            LongTensor = torch.cuda.LongTensor
+            ByteTensor = torch.cuda.ByteTensor
+            self.q_net.cuda()
+            self.q_net_target.cuda()
+
+        # DQN memory
+        self.prioritized = prioritized
+        self.memory = ReplayMemory(capacity=REPLAY_MEMORY_SIZE,
+                                   prioritized=prioritized,
+                                   nb_game_variables=self.nb_game_variables)
+
+        # DQN stuff
+        if(self.drqn):
+            self.history = np.zeros((EPISODE_LENGTH, 1, NB_CHANNELS, RESOLUTION[0], RESOLUTION[1]))
+            self.hidden_state = Variable(torch.zeros(1, 1, RNN_MEMORY).type(FloatTensor), volatile=True)
+
+
+    def append_history(self, state):
+
+        self.history = np.roll(self.history, -1, axis=0)
+        self.history[-1] = state[0,:,:,:]
+
+        # if(SHOW_IMAGES):
+        #     for i in range(EPISODE_LENGTH):
+        #         save_image(self.history[i,0,:,:,:],
+        #                         "hist_"+str(i)+".png")
+
+    def reset_history(self):
+
+        if(self.drqn):
+            self.history = np.zeros((EPISODE_LENGTH, 1, NB_CHANNELS, RESOLUTION[0],
+                                RESOLUTION[1]))
+        else:
+            self.history = np.zeros((1, 1, NB_CHANNELS, RESOLUTION[0],
+                                RESOLUTION[1]))
+
+    def learn(self, q_values, expected_q_values, weights_IS=1):
 
         # computing loss
-        criterion = nn.SmoothL1Loss()
-        loss = criterion(q_values, expected_q_values)
+        batch_loss = (q_values - expected_q_values) ** 2
+        weighted_batch_loss = weights_IS * batch_loss
+        weighted_loss = weighted_batch_loss.sum()
 
         # gradient descent step
         self.optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm(self.net.parameters(), 1)
+        weighted_loss.backward()
+        # for p in self.q_net.parameters():
+        #     p.grad.data.clamp_(-5, 5)
         self.optimizer.step()
 
-        return loss
+        return weighted_loss
 
-    def select_action(self, n_steps, state, training):
+    def select_action(self, s, v, training=False):
 
+        # epsilon greedy policy with epsilon exponentially decaying during
+        # training process
         u = random()
-        eps_threshold = eps_end + (eps_start - eps_end) * np.exp(-1. * n_steps / eps_decay)
-        if (u > eps_threshold or not training):
-            return self.net(Variable(state, volatile=True).type(torch.FloatTensor)).data.max(1)[1].view(1, 1)
+        eps = max(EPS_END, EPS_START + (self.n_steps - EPS_LIN_DECAY_START) *
+                                        (EPS_END - EPS_START) /
+                                        (EPS_LIN_DECAY_END - EPS_LIN_DECAY_START))
+        if (u > eps or not training):
+            if(self.drqn):
+                hist = Variable(torch.from_numpy(self.history), volatile=True).type(FloatTensor)
+                return self.q_net(hist, train=False).data.max(1)[1].view(1, 1)
+            else:
+                s_ = Variable(s, volatile=True).type(FloatTensor)
+                v_ = Variable(v, volatile=True).type(FloatTensor)
+                return self.q_net(s_, v_, train=False).data.max(1)[1].view(1, 1)
         else:
             return torch.LongTensor([[randint(0, len(self.actions) - 1)]])
 
-    def step(self, training):
+    def save(self):
 
-        s1 = preprocess(self.game.get_state().screen_buffer)
-        a = self.select_action(self.n_steps, s1, training)
+        torch.save(self.q_net, self.file_name)
+        print("model saved at:", self.file_name)
 
+    def step(self, training, showing=False):
+
+        # observing state and selecting action with eps-greedy policy
+        frame = self.game.get_state().screen_buffer
+        preprocessed_frame = preprocess(frame, self.drqn)
+        # save_image(preprocessed_frame, "frame.jpg")
+        s1 = torch.from_numpy(preprocessed_frame).type(torch.FloatTensor)
+        v1 = torch.FloatTensor(get_game_variables(self.game, self.available_game_variables))
+        if(self.drqn):
+            self.append_history(preprocessed_frame)
+            a = self.select_action(training=training)
+        else:
+            a = self.select_action(s=s1, v=v1, training=training)
+
+        # if we're training the DQNetwork
         if(training):
 
-            reward = torch.FloatTensor([self.game.make_action(self.actions[a.numpy()[0][0]], frame_repeat)])
+            # experiencing transition and adding it in memory
+            reward = torch.FloatTensor([self.game.make_action(self.actions[a[0][0]], FRAME_REPEAT)])
             is_terminal = self.game.is_episode_finished()
             if(not is_terminal):
-                s2 = preprocess(self.game.get_state().screen_buffer)
+                frame = self.game.get_state().screen_buffer
+                preprocessed_frame = preprocess(frame, self.drqn)
+                s2 = torch.from_numpy(preprocessed_frame).type(torch.FloatTensor)
+                v2 = torch.FloatTensor(get_game_variables(self.game, self.available_game_variables))
             else:
                 s2 = None
-            self.memory.push(s1, a, s2, reward)
+                v2 = None
+                self.reset_history()
 
 
-            if len(self.memory) > batch_size:
+            self.memory.push(s1, v1, a, s2, v2, reward)
 
-                transitions = self.memory.sample(batch_size)
-                batch = Transition(*zip(*transitions))
+             # learning
+            if (self.n_steps > REPLAY_START_SIZE and
+                self.n_steps % UPDATE_FREQUENCY == 0):
 
-                non_final_mask = torch.ByteTensor(tuple(map(lambda s: s is not None, batch.next_state)))
-                non_final_next_states = Variable(torch.cat([s for s in batch.next_state if s is not None]), volatile=True)
+                # getting sample from memory
+                if(self.drqn):
+                    batch = self.memory.sample_episode(BATCH_SIZE, EPISODE_LENGTH)
+                else:
+                    batch = self.memory.sample(BATCH_SIZE)
 
-                state_batch = Variable(torch.cat(batch.state))
-                action_batch = Variable(torch.cat(batch.action))
-                reward_batch = Variable(torch.cat(batch.reward))
+                # batch content
+                state_batch = Variable(torch.cat(batch.state, dim=self.drqn).type(FloatTensor))
+                variable_batch = Variable(torch.cat(batch.variable).type(FloatTensor))
+                action_batch = Variable(torch.cat(batch.action).type(LongTensor))
+                reward_batch = Variable(torch.cat(batch.reward).type(FloatTensor))
+                is_weights_batch = Variable((torch.cat(batch.weight) if self.prioritized else torch.zeros(BATCH_SIZE)).type(FloatTensor))
+                index_batch = torch.cat(batch.index) if self.prioritized else torch.zeros(BATCH_SIZE)
 
-                q_values = self.net(state_batch).gather(1, action_batch)
+                # taking care of final states
+                non_final_next_states = Variable(torch.cat([s for s in batch.next_state if s is not None],
+                                                dim=self.drqn).type(FloatTensor))
+                non_final_next_variables = Variable(torch.cat([v for v in batch.next_variable if v is not None],
+                                                dim=self.drqn).type(FloatTensor))
+                non_final_mask = ByteTensor(tuple(map(lambda s: s is not None, batch.next_state)))
 
-                next_v_values = Variable(torch.zeros(batch_size).type(torch.FloatTensor))
-                next_v_values[non_final_mask] = self.net(non_final_next_states).max(1)[0]
+                # duplicating batch if drqn
+                if(self.drqn):
+                    action_batch = repeat(action_batch, EPISODE_UPDATES)
+                    reward_batch = repeat(reward_batch, EPISODE_UPDATES)
+                    non_final_mask = repeat(non_final_mask, EPISODE_UPDATES)
+                    is_weights_batch = repeat(is_weights_batch, EPISODE_UPDATES)
+                    index_batch = repeat(index_batch, EPISODE_UPDATES)
 
-                next_v_values.volatile = False
-                expected_q_values = (next_v_values * discount_factor) + reward_batch
-                self.learn(q_values, expected_q_values)
+                # computing expected q values with background DQNetwork
+                if(self.ddqn or self.drqn):
+                    next_v_values = Variable(torch.zeros(BATCH_SIZE if self.ddqn
+                                    else BATCH_SIZE * EPISODE_UPDATES).type(FloatTensor))
+                    arg_max = self.q_net(non_final_next_states, non_final_next_variables).detach().max(1)[1].view(-1, 1)
+                    next_v_values[non_final_mask] = self.q_net_target(non_final_next_states, non_final_next_variables).detach().gather(1, arg_max)
+                else:
+                    next_v_values = Variable(torch.zeros(BATCH_SIZE).type(FloatTensor))
+                    next_v_values[non_final_mask] = self.q_net_target(non_final_next_states, non_final_next_variables).detach().max(1)[0]
+                expected_q_values = next_v_values * DISCOUNT_FACTOR + reward_batch
+                expected_q_values.volatile = False
 
+                # computing q values with DQNetwork
+                q_values = self.q_net(state_batch, variable_batch).gather(1, action_batch).squeeze()
 
+                # computing errors and weigths for prioritized experience replay
+                if(self.prioritized):
+                    errors = torch.abs(q_values - expected_q_values) ** ALPHA
+                    BETA = min(BETA_END, BETA_START + (self.n_steps - BETA_LIN_DECAY_START) *
+                                                    (BETA_END - BETA_START) /
+                                                    (BETA_LIN_DECAY_END - BETA_LIN_DECAY_START))
+                    is_weights_batch = is_weights_batch ** BETA
+                    is_weights_batch = is_weights_batch / is_weights_batch.max()
+                    self.memory.update_prior(index_batch, errors)
+
+                # descent step
+                self.learn(q_values, expected_q_values, is_weights_batch)
+
+                # updating the background DQNetwork every
+                # Q_NET_UPDATE_FREQUENCY step
+                # if((self.n_steps % Q_NET_UPDATE_FREQUENCY == 0) and
+                #     self.n_steps >= 2 * REPLAY_START_SIZE):
+                #     self.q_net_target = copy.deepcopy(self.q_net)
+
+                for p, q in zip(self.q_net_target.parameters(), self.q_net.parameters()):
+                    p.data = LAG * copy.deepcopy(p.data) + (1 - LAG) * copy.deepcopy(q.data)
+
+            self.n_steps += 1
+
+        # otherwise we just simulate the action
         else:
-            self.game.set_action(self.actions[a.numpy()[0][0]])
-            for _ in range(frame_repeat):
-                self.game.advance_action()
-                sleep(0.03)
-
-        self.n_steps += 1
+            if(showing):
+                self.game.set_action(self.actions[a[0][0]])
+                for _ in range(FRAME_REPEAT):
+                    self.game.advance_action()
+            else:
+                self.game.make_action(self.actions[a[0][0]], FRAME_REPEAT)
+            is_terminal = self.game.is_episode_finished()
+            if(is_terminal):
+                self.reset_history()
